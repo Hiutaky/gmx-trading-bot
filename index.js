@@ -11,10 +11,12 @@ import PositionRouterAbi from "./abis/PositionRouter.json" assert { type: "json"
 import OrderBookAbi from "./abis/OrderBook.json" assert { type: "json" }
 import ERC20Abi from "./abis/ERC20.json" assert { type: "json" }
 import ReaderAbi from "./abis/Reader.json" assert { type: "json" }
-import TOKENS, { getEventArgs, getEventName, getOrderSize, getTokenNameByAddress, payloadToTuple } from "./src/utils/tokens.js";
+import TOKENS, { BN0, getEventArgs, getEventName, getOrderSize, getTokenNameByAddress, payloadToTuple } from "./src/utils/tokens.js";
+import PositionRouter from "./src/contracts/PositionRouter.js";
+import OrderBook from "./src/contracts/OrderBook.js";
+
 dotenv.config()
 
-const BN0 =  BigNumber.from('0')
 const CRONOS_RPC = 'https://evm.cronos.org'
 const UserToTrack = process.env.ADDRESS_TO_COPY.toLowerCase()
 
@@ -53,7 +55,8 @@ const initUser = async () => {
         Balances[name] = await Contracts[name].balanceOf( Signer.address )
         Decimals[name] = await Contracts[name].decimals()
     }
-    console.log(`Welcome ${Signer.address} - Balances`)
+    console.log(`Welcome ${Signer.address}`)
+    console.log(`Balances`)
     console.log(`  Governance: ${ethers.utils.formatEther(Balance)} CRO`)
     Object.keys(Balances).map( (name, i) => {
         const orderSize = utils.parseUnits( TOKENS[i].size, Decimals[name] )
@@ -65,12 +68,12 @@ const initUser = async () => {
 
 const listenToEvents = async () => {
     console.log('Loading Contracts')
-    Fulcrom.PositionRouter = new ethers.Contract(
+    Fulcrom.PositionRouter = new PositionRouter(
         Fulcrom.addresses.positionRouter,
         PositionRouterAbi,
         Signer
     )
-    Fulcrom.OrderBook = new ethers.Contract(
+    Fulcrom.OrderBook = new OrderBook(
         Fulcrom.addresses.orderBook,
         OrderBookAbi,
         Signer
@@ -81,8 +84,8 @@ const listenToEvents = async () => {
         Signer
     )
     console.log('Starting Event Handlers')
-    Fulcrom.PositionRouter.on("CreateIncreasePosition", async (...args) => await handleIncreasePosition(args) )
-    Fulcrom.PositionRouter.on("CreateDecreasePosition", async (...args) => await handleDecreasePosition(args) )
+    Fulcrom.PositionRouter.contract.on("CreateIncreasePosition", async (...args) => await handleIncreasePosition(args) )
+    Fulcrom.PositionRouter.contract.on("CreateDecreasePosition", async (...args) => await handleDecreasePosition(args) )
     //Fulcrom.OrderBook.on("CreateIncreaseOrder", async (...args) => await handleIncreasePosition(args) )
     //Fulcrom.OrderBook.on("CreateDecreaseOrder", async (...args) => await handleDecreasePosition(args))
 }
@@ -104,35 +107,25 @@ const handleDecreasePosition = async (event) => {
     const isMarketOrder = eventName === 'CreateDecreasePosition'
     const name = getTokenNameByAddress(args.indexToken)
     if( ! name || args.account.toLowerCase() !== UserToTrack ) return
-    const positionRouter = getUserPostion( name, args.isLong )
-    if( isMarketOrder ) {
-        if( positionRouter.length ) {
-            const payload = {
-                path: args.path,
-                indexToken: args.indexToken,
-                collateralDelta: BN0,
-                sizeDelta: positionRouter[0],
-                isLong: args.isLong,
-                receiver: Signer.address,
-                acceptablePrice: args.acceptablePrice,
-                minOut: BN0,
-                executionFee: args.executionFee,
-                withdrawETH: false,
-                callbackTarget: constants.AddressZero,
-                priceData: [] 
-            }
-            const formatted = payloadToTuple(payload)
-            const tx = await Fulcrom.PositionRouter.createDecreasePosition(
-                formatted, 
-                {
-                    value: utils.parseEther('4')
-                }
+    const positions = await getUserPostion( name, args.isLong )
+    let request = false
+    if( positions.length ) {
+        if( isMarketOrder ) {
+            request = await Fulcrom.PositionRouter.increaseOrder(
+                positions[0],
+                args
             )
-            const recipit = await tx.wait(2)
-            console.log(`Position Closed`, recipit)
+        } else {
+            request = await Fulcrom.OrderBook.decreaseOrder(
+                positions[0],
+                args
+            )
         }
+        console.log('Transaction Sent, waiting for confirmation...')
+        const recipit = await request.tx.wait(2)
+        console.log(`Executed ${ isMarketOrder ? `Market Close` : `Trigger Close Order` } `)
     } else {
-        //Handle Trigger Orders
+        console.log(`Skipping. No open position for ${name}`)
     }
 }
 
@@ -141,76 +134,42 @@ const handleIncreasePosition = async (event) => {
     const name = getTokenNameByAddress(args.indexToken)
     const eventName = getEventName(event)
     const isMarketOrder = eventName === 'CreateIncreasePosition'
-
     if( ! name || args.account.toLowerCase() !== UserToTrack ) return //return if traded token not available in TOKENS or User is differentt than UserToTrack
     if( ! Tradable[name] ) return //return if there's not enough balance based on Token Position Size
-
-    const eventAmountIn = isMarketOrder ? args.amountIn : args.purchaseTokenAmount
-    const execPrice = isMarketOrder ? args.acceptablePrice : args.triggerPrice 
-    const collateralInUsd = eventAmountIn.mul( execPrice )
-    const leverage = args.sizeDelta.mul('10000000000').div(collateralInUsd)
-
-    const personalSize = getOrderSize(name)
-    const amountIn =  utils.parseUnits( personalSize, Decimals[name] )
+    let request = false
+    const amountIn =  utils.parseUnits( getOrderSize(name), Decimals[name] )
+    const decimals = Decimals[name]
     
     console.log(``)
-    console.log(`Valid Incoming ${name.toUpperCase()} ${ args.isLong ? `LONG` : `SHORT` }`, `${leverage / 100}x` )
-    let tx = false
-    let sizeDelta, acceptablePrice = false
-    if( isMarketOrder ) {
-        sizeDelta = amountIn.mul(leverage).mul(args.acceptablePrice).div(100).div(10**8)
-        const payload = {
-            path: args.path,
-            indexToken: args.indexToken,
-            sizeDelta: sizeDelta,
-            isLong: args.isLong,
-            acceptablePrice: args.acceptablePrice,
-            minOut: args.minOut,
-            executionFee: args.executionFee,
-            referralCode: constants.HashZero,
-            callbackTarget: constants.AddressZero,
-            priceData: []//priceData
-        }
-        const formattedPayload = payloadToTuple(payload)
-        tx = await Fulcrom.PositionRouter.createIncreasePosition(
-            formattedPayload, 
-            amountIn, 
-            {
-                value: utils.parseEther(`4`)
-            }
+    console.log(`Fetch ${name.toUpperCase()} ${ args.isLong ? `LONG` : `SHORT` }` )
+    console.log(`Order type: ${isMarketOrder ? `Market` : `Trigger`}`)
+    console.log(`Price: ${ isMarketOrder ? args.acceptablePrice : args.triggerPrice }`)
+    if( isMarketOrder )
+        request = await Fulcrom.PositionRouter.increasePosition(
+            amountIn,
+            args,
+            decimals
         )
-    } else {
-        sizeDelta = amountIn.mul(leverage).mul(args.triggerPrice).div(100).div(10**8)
-        tx = await Fulcrom.OrderBook.createIncreaseOrder(
-            [args.indexToken], //path
-            amountIn, //amountIn
-            args.indexToken, //indexToken
-            BN0, //minOut
-            sizeDelta, //sizeDelta
-            args.indexToken, //collateralToken
-            args.isLong,//isLong
-            args.triggerPrice, //triggerPrice
-            args.triggerAboveThreshold, //triggerAboveThreshold,
-            args.executionFee,//executionFee
-            false,
-            {
-                value: args.executionFee //executionFee || value, must be the same value
-            }
+    else
+        request = await Fulcrom.OrderBook.increaseOrder(
+            amountIn,
+            args,
+            decimals
         )
-    }
-    console.log('Trade Transaction Sent, waiting for confirmation...')
-    const recipit = await tx.wait(2)
+    
+    console.log('Transaction Sent, waiting for confirmation...')
+    const recipit = await request.tx.wait(2)
     console.table([
         {
             action: 'Fetch', 
-            margin: `$${utils.formatUnits( collateralInUsd, 38 )}`, 
+            margin: `$${utils.formatUnits( request.eventCollateral, 38 )}`, 
             size: `$${utils.formatUnits( args.sizeDelta, 30 ) }`,
-            leverage: `${leverage / 100}x`
+            leverage: `${request.leverage / 100}x`
         },{
             action: 'Executed', 
-            margin: `$${utils.formatUnits( amountIn.mul(acceptablePrice), 38 )}`, 
-            size: `$${utils.formatUnits( sizeDelta, 38 ) }`,
-            leverage: `${leverage / 100}x`
+            margin: `$${request.collateral}`, 
+            size: `$${utils.formatUnits( request.sizeDelta, 38 ) }`,
+            leverage: `${request.leverage / 100}x`
         }
     ])
 }

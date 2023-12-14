@@ -10,6 +10,8 @@ const TOKENS = [{
     address: '0xe44fd7fcb2b1581822d0c862b68222998a0c299a'
 }]
 
+export const BN0 =  BigNumber.from('0')
+
 export const payloadToTuple = (payload) => {
     return Object.keys(payload).map( key => payload[key])
 }
